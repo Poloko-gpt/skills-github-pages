@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071321">
+  <title>SCADA Lector</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    :root{color-scheme:dark;--bg:#071321;--panel:#102238;--line:#25415d;--blue:#1687ff;--text:#edf5ff;--muted:#a9bfd5}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,Arial,sans-serif}
+    main{max-width:1050px;margin:auto;padding:16px}h1{font-size:1.55rem;margin:4px 0}p{color:var(--muted);line-height:1.45}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
+    button,select,input{font:inherit;border-radius:9px;border:1px solid var(--line);padding:10px;background:#091a2b;color:var(--text);max-width:100%}
+    button{background:var(--blue);border:0;font-weight:650;cursor:pointer;margin:4px 4px 4px 0}button.secondary{background:#29435e}button.danger{background:#b93838}
+    video{width:100%;max-height:55vh;background:#000;border-radius:10px;object-fit:contain}label{display:block;font-size:.9rem;color:var(--muted);margin:8px 0 4px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.row>div{flex:1;min-width:130px}.status{color:#8ee8a2;white-space:pre-wrap}.small{font-size:.85rem}.numbers{font-size:.95rem;white-space:pre-wrap;overflow-wrap:anywhere;background:#071321;padding:10px;border-radius:8px}
+    table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:9px 6px;border-bottom:1px solid var(--line)}th{color:#a9bfd5}.tablewrap{overflow:auto}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>📷 SCADA Lector</h1>
+    <p>Prototipo para leer texto/valores visibles en la pantalla del notebook usando la cámara del celular y guardar lecturas en CSV compatible con Excel.</p>
+    <div class="panel">
+      <h2>1. Cámara</h2>
+      <video id="video" autoplay playsinline muted></video>
+      <div class="row">
+        <button id="start">Activar cámara</button><button class="secondary" id="capture">Capturar y leer OCR</button><button class="secondary" id="stop">Apagar cámara</button>
+      </div>
+      <label for="interval">Lectura automática</label>
+      <div class="row"><div><select id="interval"><option value="0" selected>Desactivada (manual)</option><option value="10">Cada 10 segundos</option><option value="30">Cada 30 segundos</option><option value="60">Cada 60 segundos</option></select></div><div><button id="auto" class="secondary">Aplicar intervalo</button></div></div>
+      <div id="status" class="status" role="status">Listo. Activa la cámara y apunta a la pantalla SCADA.</div>
+    </div>
+    <div class="panel">
+      <h2>2. Texto reconocido</h2>
+      <p class="small">El OCR intenta reconocer el texto visible. La asociación entre etiquetas y números depende de la nitidez, reflejos y diseño de la pantalla.</p>
+      <div id="ocr" class="numbers">Todavía no hay una lectura.</div>
+      <button id="addDetected" class="secondary">Registrar números detectados (revisar antes)</button>
+    </div>
+    <div class="panel">
+      <h2>3. Registrar una lectura manual/corregida</h2>
+      <div class="row">
+        <div><label for="instrument">Instrumento</label><input id="instrument" placeholder="Ej. Caudal impulsión"></div>
+        <div><label for="value">Valor</label><input id="value" inputmode="decimal" placeholder="Ej. 180.5"></div>
+        <div><label for="unit">Unidad</label><input id="unit" placeholder="Ej. L/s"></div>
+      </div>
+      <button id="add">Agregar al registro</button>
+    </div>
+    <div class="panel">
+      <div class="row" style="justify-content:space-between;align-items:center"><h2>4. Registro</h2><div><button id="export">Exportar CSV</button><button id="clear" class="danger">Borrar registros</button></div></div>
+      <div class="tablewrap"><table><thead><tr><th>Fecha y hora</th><th>Instrumento</th><th>Valor</th><th>Unidad</th><th>Origen</th></tr></thead><tbody id="records"></tbody></table></div>
+      <p class="small">Los registros se mantienen en esta página mientras permanezca abierta. Exporta el CSV para conservarlos.</p>
+    </div>
+    <p class="small">Importante: úsalo solo con autorización en el entorno industrial. Esta aplicación es de supervisión/registro; no controla el SCADA ni debe usarse como sistema de seguridad.</p>
+  </main>
+  <script>
+    const video=document.querySelector('#video'), statusEl=document.querySelector('#status'), ocrEl=document.querySelector('#ocr');
+    let stream=null, timer=null, lastText='', records=[];
+    const say=t=>statusEl.textContent=t;
+    async function startCamera(){
+      try{
+        stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+        video.srcObject=stream; await video.play(); say('Cámara activa. Apunta a la pantalla y evita reflejos.');
+      }catch(e){say('No se pudo abrir la cámara: '+e.message+'. Revisa permisos y abre esta página mediante HTTPS o localhost.');}
+    }
+    function stopCamera(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}video.srcObject=null;if(timer){clearInterval(timer);timer=null}say('Cámara apagada.')}
+    async function captureAndRead(){
+      if(!stream){say('Primero activa la cámara.');return}
+      if(!window.Tesseract){say('No se cargó Tesseract.js. Revisa la conexión a internet.');return}
+      try{
+        say('Analizando imagen… puede tardar unos segundos.');
+        const c=document.createElement('canvas'); c.width=video.videoWidth; c.height=video.videoHeight;
+        if(!c.width){say('La cámara aún no está lista.');return}
+        const ctx=c.getContext('2d');ctx.drawImage(video,0,0,c.width,c.height);
+        const result=await Tesseract.recognize(c,'eng');
+        lastText=(result.data.text||'').trim();
+        ocrEl.textContent=lastText||'(No se reconoció texto. Acerca la cámara, mejora la luz o evita reflejos.)';
+        say('Lectura terminada. Confirma los valores antes de registrarlos.');
+      }catch(e){say('Error OCR: '+e.message)}
+    }
+    function addRecord(instrument,value,unit,source='Manual/corregido'){
+      if(!instrument.trim()||String(value).trim()===''){say('Completa instrumento y valor.');return}
+      records.push({date:new Date().toLocaleString('sv-SE'),instrument:instrument.trim(),value:String(value).trim(),unit:unit.trim(),source});
+      render();say('Lectura agregada al registro.');
+    }
+    function render(){
+      const tbody=document.querySelector('#records');tbody.replaceChildren();
+      records.slice().reverse().forEach(r=>{const tr=document.createElement('tr');[r.date,r.instrument,r.value,r.unit,r.source].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td)});tbody.appendChild(tr)})
+    }
+    document.querySelector('#start').onclick=startCamera;
+    document.querySelector('#stop').onclick=stopCamera;
+    document.querySelector('#capture').onclick=captureAndRead;
+    document.querySelector('#auto').onclick=()=>{
+      if(timer){clearInterval(timer);timer=null}
+      const secs=Number(document.querySelector('#interval').value);
+      if(secs>0){if(!stream){say('Activa la cámara antes de programar lecturas automáticas.');return}timer=setInterval(captureAndRead,secs*1000);say('Lectura automática cada '+secs+' segundos. Revisa el texto y registra los valores correctos.')}
+      else say('Lectura automática desactivada.');
+    };
+    document.querySelector('#add').onclick=()=>{addRecord(document.querySelector('#instrument').value,document.querySelector('#value').value,document.querySelector('#unit').value);};
+    document.querySelector('#addDetected').onclick=()=>{
+      if(!lastText){say('Primero captura una imagen y ejecuta OCR.');return}
+      const candidates=[...lastText.matchAll(/[-+]?\d+(?:[.,]\d+)?/g)].map(m=>m[0].replace(',','.'));
+      if(!candidates.length){say('No se detectaron números.');return}
+      const chosen=prompt('Números detectados: '+candidates.join(', ')+'\nEscribe el número exacto que quieres registrar:');
+      if(chosen===null)return;
+      const val=chosen.trim().replace(',','.');
+      if(!candidates.map(x=>x.replace(',','.')).includes(val)){say('Ese número no aparece entre los candidatos detectados.');return}
+      const instrument=prompt('Nombre del instrumento (ej. Caudal impulsión):','Instrumento por identificar');
+      if(instrument===null)return;
+      const unit=prompt('Unidad (ej. L/s, bar, %, °C):','');
+      if(unit===null)return;
+      addRecord(instrument,val,unit,'OCR revisado');
+    };
+    document.querySelector('#export').onclick=()=>{
+      if(!records.length){say('No hay registros para exportar.');return}
+      const esc=v=>'"'+String(v).replace(/"/g,'""')+'"';
+      const rows=[['Fecha y hora','Instrumento','Valor','Unidad','Origen'],...records.map(r=>[r.date,r.instrument,r.value,r.unit,r.source])];
+      const csv='\ufeff'+rows.map(r=>r.map(esc).join(';')).join('\r\n');
+      const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
+      const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='registro_scada.csv';a.click();URL.revokeObjectURL(url);say('CSV exportado. Puedes abrirlo con Excel.');
+    };
+    document.querySelector('#clear').onclick=()=>{if(confirm('¿Borrar todos los registros de esta sesión?')){records=[];render();say('Registros borrados.')}};
+  </script>
+</body>
+</html>
